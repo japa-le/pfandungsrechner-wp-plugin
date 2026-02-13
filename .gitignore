@@ -1,0 +1,15 @@
+# Local / IDE
+.clinerules
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs / temp
+*.log
+*.tmp
+
+# Keep vendor committed for WP plugin distribution
+# /vendor/
