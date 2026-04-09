@@ -50,11 +50,7 @@ function pfaendungsrechner_install() {
  * Plugin-Deaktivierung: nur geplante Events entfernen (keine Daten löschen)
  */
 function pfaendungsrechner_deactivate() {
-    $timestamp = wp_next_scheduled('update_pfaendungstabellen_event');
-    while ($timestamp) {
-        wp_unschedule_event($timestamp, 'update_pfaendungstabellen_event');
-        $timestamp = wp_next_scheduled('update_pfaendungstabellen_event');
-    }
+    pfaendungsrechner_unschedule_all_update_events();
 }
 
 /**
@@ -67,61 +63,34 @@ function pfaendungsrechner_uninstall() {
 }
 
 // Cron-Job registrieren (jährlich am 1. Juli oder nächster Werktag)
-add_action('wp', 'pfaendungsrechner_schedule_yearly_update');
+// Läuft auf init, damit auch im Admin-Bereich alte/legacy Cron-Jobs bereinigt werden.
+add_action('init', 'pfaendungsrechner_schedule_yearly_update');
 function pfaendungsrechner_schedule_yearly_update() {
-    $hook = 'update_pfaendungstabellen_event';
-    $next_update = pfaendungsrechner_get_next_update_date();
-    $scheduled_timestamp = wp_next_scheduled($hook);
+    $event = wp_get_scheduled_event('update_pfaendungstabellen_event');
 
-    $found_events = 0;
-    $has_non_yearly_event = false;
-
-    // Bestehende Cron-Einträge prüfen (Migration von alten Intervallen wie "daily")
-    if (function_exists('_get_cron_array')) {
-        $crons = _get_cron_array();
-        if (is_array($crons)) {
-            foreach ($crons as $timestamp => $events) {
-                if (empty($events[$hook]) || !is_array($events[$hook])) {
-                    continue;
-                }
-
-                foreach ($events[$hook] as $event) {
-                    $found_events++;
-                    $schedule = isset($event['schedule']) ? $event['schedule'] : '';
-                    if ($schedule !== 'yearly') {
-                        $has_non_yearly_event = true;
-                    }
-                }
-            }
-        }
+    // Legacy-Migration: Falls noch ein täglicher (oder anderer) alter Cron aktiv ist,
+    // wird er entfernt und durch den jährlichen ersetzt.
+    if ($event && $event->schedule !== 'yearly') {
+        error_log("Legacy Cron gefunden ({$event->schedule}) - stelle auf yearly um.");
+        pfaendungsrechner_unschedule_all_update_events();
+        $event = null;
     }
 
-    $needs_reschedule = false;
-
-    // Neu planen, wenn kein Event existiert
-    if (!$scheduled_timestamp) {
-        $needs_reschedule = true;
+    if (!$event) {
+        $next_update = pfaendungsrechner_get_next_update_date();
+        wp_schedule_event($next_update, 'yearly', 'update_pfaendungstabellen_event');
+        error_log("Pfändungstabelle Update geplant für: " . date('Y-m-d H:i:s', $next_update));
     }
+}
 
-    // Neu planen, wenn alte/falsche Events vorhanden sind oder mehrfach geplant wurde
-    if ($has_non_yearly_event || $found_events > 1) {
-        $needs_reschedule = true;
-    }
-
-    // Neu planen, wenn der nächste Termin deutlich vom Soll-Datum abweicht
-    if ($scheduled_timestamp && abs($scheduled_timestamp - $next_update) > DAY_IN_SECONDS) {
-        $needs_reschedule = true;
-    }
-
-    if ($needs_reschedule) {
-        $timestamp = wp_next_scheduled($hook);
-        while ($timestamp) {
-            wp_unschedule_event($timestamp, $hook);
-            $timestamp = wp_next_scheduled($hook);
-        }
-
-        wp_schedule_event($next_update, 'yearly', $hook);
-        error_log("Pfändungstabelle Cron bereinigt und neu geplant für: " . date('Y-m-d H:i:s', $next_update));
+/**
+ * Entfernt alle geplanten Update-Events dieses Plugins.
+ */
+function pfaendungsrechner_unschedule_all_update_events() {
+    $timestamp = wp_next_scheduled('update_pfaendungstabellen_event');
+    while ($timestamp) {
+        wp_unschedule_event($timestamp, 'update_pfaendungstabellen_event');
+        $timestamp = wp_next_scheduled('update_pfaendungstabellen_event');
     }
 }
 
@@ -679,105 +648,4 @@ function pfaendungsrechner_manual_trigger_page() {
         </div>
     </div>
     <?php
-}
-
-/* Preisrechner */
-
-// Shortcode für den Preisrechner
-add_shortcode('preisrechner', 'render_preisrechner');
-
-function render_preisrechner() {
-    ob_start();
-    ?>
-    <form id="preisrechner-form">
-        <div class="droppersnofle">
-            <label for="verfahren">Insolvenzverfahren:</label>
-            <select id="verfahren" name="verfahren" required>
-                <option value="" disabled selected>Bitte wählen Sie ein Verfahren</option>
-                <option value="verbraucher">Verbraucherinsolvenz</option>
-                <option value="regel">Regelinsolvenz</option>
-                <option value="firmen">Firmeninsolvenz</option>
-            </select>
-            <div id="verfahren-price"></div>
-        </div>
-
-        <div class="droppers">
-            <label for="glaeubiger">
-                Gläubigeranzahl<br>(5 inkl., danach 11,90 €/Gläubiger):
-            </label>
-            <input type="number" id="glaeubiger" name="glaeubiger" min="0" required>
-        </div>
-
-        <div class="droppers">
-            <label for="grundbesitz">Haus-/Grundbesitz<br>(je 75,00 €):</label>
-            <input type="number" id="grundbesitz" name="grundbesitz" min="0" required>
-        </div>
-
-        <button id="preisrechner-submit" type="submit">Berechnen</button>
-    </form>
-
-    <div id="preisrechner-result"></div>
-
-    <script>
-    (function () {
-        const verfahrenSelect = document.getElementById('verfahren');
-        const verfahrenPrice  = document.getElementById('verfahren-price');
-        const form            = document.getElementById('preisrechner-form');
-        const submitBtn       = document.getElementById('preisrechner-submit'); // ← nur dieser Button!
-
-       // Preis-Anzeige + Button-Steuerung bei Auswahl des Verfahrens
-verfahrenSelect.addEventListener('change', function () {
-    const verfahren = this.value;
-    let grundpreis  = 0;
-    let text        = '';
-
-    // Ergebnis löschen, falls vorher berechnet wurde
-    document.getElementById('preisrechner-result').innerText = '';
-
-    if (verfahren === 'verbraucher') {
-        grundpreis = 399.00;
-        text = `Grundpreis: ${grundpreis.toFixed(2)} € (inkl. MwSt)`;
-        submitBtn.style.display = 'inline-block';
-    } else if (verfahren === 'regel') {
-        grundpreis = 399.00;
-        text = `Grundpreis: ${grundpreis.toFixed(2)} € (inkl. MwSt)`;
-        submitBtn.style.display = 'inline-block';
-    } else if (verfahren === 'firmen') {
-        text = '<b>Preis auf Anfrage.</b>';
-        submitBtn.style.display = 'none';
-    }
-
-    verfahrenPrice.innerHTML = text;
-});
-
-
-        // Berechnung
-        form.addEventListener('submit', function (e) {
-            e.preventDefault();
-
-            const verfahren = verfahrenSelect.value;
-            if (verfahren === 'firmen') {
-                return; // Safety
-            }
-
-            const glaeubiger  = parseInt(document.getElementById('glaeubiger').value, 10) || 0;
-            const grundbesitz = parseInt(document.getElementById('grundbesitz').value, 10) || 0;
-
-            let grundpreis = 0;
-            if (verfahren === 'verbraucher') grundpreis = 399.00;
-            if (verfahren === 'regel')       grundpreis = 399.00;
-
-            const extra = Math.max(0, glaeubiger - 5);
-            const glaeubigerKosten = extra * 11.90;
-            const grundbesitzKosten = grundbesitz * 75.00;
-
-            const gesamt = (grundpreis + glaeubigerKosten + grundbesitzKosten).toFixed(2);
-
-            document.getElementById('preisrechner-result').innerText =
-                `Gesamtkosten: ${gesamt} € (inkl. MwSt)`;
-        });
-    })();
-    </script>
-    <?php
-    return ob_get_clean();
 }
