@@ -69,10 +69,59 @@ function pfaendungsrechner_uninstall() {
 // Cron-Job registrieren (jährlich am 1. Juli oder nächster Werktag)
 add_action('wp', 'pfaendungsrechner_schedule_yearly_update');
 function pfaendungsrechner_schedule_yearly_update() {
-    if (!wp_next_scheduled('update_pfaendungstabellen_event')) {
-        $next_update = pfaendungsrechner_get_next_update_date();
-        wp_schedule_event($next_update, 'yearly', 'update_pfaendungstabellen_event');
-        error_log("Pfändungstabelle Update geplant für: " . date('Y-m-d H:i:s', $next_update));
+    $hook = 'update_pfaendungstabellen_event';
+    $next_update = pfaendungsrechner_get_next_update_date();
+    $scheduled_timestamp = wp_next_scheduled($hook);
+
+    $found_events = 0;
+    $has_non_yearly_event = false;
+
+    // Bestehende Cron-Einträge prüfen (Migration von alten Intervallen wie "daily")
+    if (function_exists('_get_cron_array')) {
+        $crons = _get_cron_array();
+        if (is_array($crons)) {
+            foreach ($crons as $timestamp => $events) {
+                if (empty($events[$hook]) || !is_array($events[$hook])) {
+                    continue;
+                }
+
+                foreach ($events[$hook] as $event) {
+                    $found_events++;
+                    $schedule = isset($event['schedule']) ? $event['schedule'] : '';
+                    if ($schedule !== 'yearly') {
+                        $has_non_yearly_event = true;
+                    }
+                }
+            }
+        }
+    }
+
+    $needs_reschedule = false;
+
+    // Neu planen, wenn kein Event existiert
+    if (!$scheduled_timestamp) {
+        $needs_reschedule = true;
+    }
+
+    // Neu planen, wenn alte/falsche Events vorhanden sind oder mehrfach geplant wurde
+    if ($has_non_yearly_event || $found_events > 1) {
+        $needs_reschedule = true;
+    }
+
+    // Neu planen, wenn der nächste Termin deutlich vom Soll-Datum abweicht
+    if ($scheduled_timestamp && abs($scheduled_timestamp - $next_update) > DAY_IN_SECONDS) {
+        $needs_reschedule = true;
+    }
+
+    if ($needs_reschedule) {
+        $timestamp = wp_next_scheduled($hook);
+        while ($timestamp) {
+            wp_unschedule_event($timestamp, $hook);
+            $timestamp = wp_next_scheduled($hook);
+        }
+
+        wp_schedule_event($next_update, 'yearly', $hook);
+        error_log("Pfändungstabelle Cron bereinigt und neu geplant für: " . date('Y-m-d H:i:s', $next_update));
     }
 }
 
@@ -332,16 +381,24 @@ function render_pfaendungsrechner() {
             .then(response => response.json())
             .then(data => {
                 const resultDiv = document.getElementById('pfaendungsrechner-result');
-                if (data.message) {
-                    // Zeige Nachricht (z. B. bei vollständiger Pfändbarkeit)
-                    resultDiv.innerText = data.message;
-                } else if (data.error) {
+                const payload = data?.data || {};
+
+                if (!data?.success) {
                     // Zeige Fehlernachricht
-                    resultDiv.innerText = data.error;
-                } else {
+                    resultDiv.innerText = payload.error || 'Es ist ein Fehler aufgetreten. Bitte versuchen Sie es erneut.';
+                } else if (payload.message) {
+                    // Zeige Nachricht (z. B. bei vollständiger Pfändbarkeit)
+                    resultDiv.innerText = payload.message;
+                } else if (typeof payload.result !== 'undefined') {
                     // Zeige berechneten Pfändungsbetrag
-                    resultDiv.innerText = `Pfändbarer Betrag: ${data.result} €`;
+                    resultDiv.innerText = `Pfändbarer Betrag: ${payload.result} €`;
+                } else {
+                    // Fallback bei unerwarteter Antwortstruktur
+                    resultDiv.innerText = 'Berechnung abgeschlossen, aber es konnte kein Betrag angezeigt werden.';
                 }
+            })
+            .catch(() => {
+                document.getElementById('pfaendungsrechner-result').innerText = 'Netzwerkfehler. Bitte versuchen Sie es erneut.';
             });
         });
     </script>
@@ -622,4 +679,105 @@ function pfaendungsrechner_manual_trigger_page() {
         </div>
     </div>
     <?php
+}
+
+/* Preisrechner */
+
+// Shortcode für den Preisrechner
+add_shortcode('preisrechner', 'render_preisrechner');
+
+function render_preisrechner() {
+    ob_start();
+    ?>
+    <form id="preisrechner-form">
+        <div class="droppersnofle">
+            <label for="verfahren">Insolvenzverfahren:</label>
+            <select id="verfahren" name="verfahren" required>
+                <option value="" disabled selected>Bitte wählen Sie ein Verfahren</option>
+                <option value="verbraucher">Verbraucherinsolvenz</option>
+                <option value="regel">Regelinsolvenz</option>
+                <option value="firmen">Firmeninsolvenz</option>
+            </select>
+            <div id="verfahren-price"></div>
+        </div>
+
+        <div class="droppers">
+            <label for="glaeubiger">
+                Gläubigeranzahl<br>(5 inkl., danach 11,90 €/Gläubiger):
+            </label>
+            <input type="number" id="glaeubiger" name="glaeubiger" min="0" required>
+        </div>
+
+        <div class="droppers">
+            <label for="grundbesitz">Haus-/Grundbesitz<br>(je 75,00 €):</label>
+            <input type="number" id="grundbesitz" name="grundbesitz" min="0" required>
+        </div>
+
+        <button id="preisrechner-submit" type="submit">Berechnen</button>
+    </form>
+
+    <div id="preisrechner-result"></div>
+
+    <script>
+    (function () {
+        const verfahrenSelect = document.getElementById('verfahren');
+        const verfahrenPrice  = document.getElementById('verfahren-price');
+        const form            = document.getElementById('preisrechner-form');
+        const submitBtn       = document.getElementById('preisrechner-submit'); // ← nur dieser Button!
+
+       // Preis-Anzeige + Button-Steuerung bei Auswahl des Verfahrens
+verfahrenSelect.addEventListener('change', function () {
+    const verfahren = this.value;
+    let grundpreis  = 0;
+    let text        = '';
+
+    // Ergebnis löschen, falls vorher berechnet wurde
+    document.getElementById('preisrechner-result').innerText = '';
+
+    if (verfahren === 'verbraucher') {
+        grundpreis = 399.00;
+        text = `Grundpreis: ${grundpreis.toFixed(2)} € (inkl. MwSt)`;
+        submitBtn.style.display = 'inline-block';
+    } else if (verfahren === 'regel') {
+        grundpreis = 399.00;
+        text = `Grundpreis: ${grundpreis.toFixed(2)} € (inkl. MwSt)`;
+        submitBtn.style.display = 'inline-block';
+    } else if (verfahren === 'firmen') {
+        text = '<b>Preis auf Anfrage.</b>';
+        submitBtn.style.display = 'none';
+    }
+
+    verfahrenPrice.innerHTML = text;
+});
+
+
+        // Berechnung
+        form.addEventListener('submit', function (e) {
+            e.preventDefault();
+
+            const verfahren = verfahrenSelect.value;
+            if (verfahren === 'firmen') {
+                return; // Safety
+            }
+
+            const glaeubiger  = parseInt(document.getElementById('glaeubiger').value, 10) || 0;
+            const grundbesitz = parseInt(document.getElementById('grundbesitz').value, 10) || 0;
+
+            let grundpreis = 0;
+            if (verfahren === 'verbraucher') grundpreis = 399.00;
+            if (verfahren === 'regel')       grundpreis = 399.00;
+
+            const extra = Math.max(0, glaeubiger - 5);
+            const glaeubigerKosten = extra * 11.90;
+            const grundbesitzKosten = grundbesitz * 75.00;
+
+            const gesamt = (grundpreis + glaeubigerKosten + grundbesitzKosten).toFixed(2);
+
+            document.getElementById('preisrechner-result').innerText =
+                `Gesamtkosten: ${gesamt} € (inkl. MwSt)`;
+        });
+    })();
+    </script>
+    <?php
+    return ob_get_clean();
 }
